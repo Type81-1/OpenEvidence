@@ -12,7 +12,7 @@ from openai import (
     RateLimitError,
 )
 
-from vector_db import search
+from vector_db import search_with_details
 
 
 # ============================================================
@@ -48,6 +48,16 @@ OPENAI_MODEL = os.getenv(
     "gpt-5-mini",
 ).strip()
 
+OPENAI_BASE_URL = os.getenv(
+    "OPENAI_BASE_URL",
+    "",
+).strip()
+
+LLM_THINKING = os.getenv(
+    "LLM_THINKING",
+    "",
+).strip().lower()
+
 # 可选模式：
 #
 # auto：
@@ -68,18 +78,123 @@ LLM_MODE = os.getenv(
 # 构造证据上下文
 # ============================================================
 
-def build_evidence_context(
-    evidence_list: list[str],
+def get_metadata(
+    evidence: dict,
+) -> dict:
+    """
+    兼容 search_with_details 返回的顶层字段和 metadata 字段。
+    """
+
+    metadata = evidence.get(
+        "metadata",
+        {},
+    )
+
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    return metadata
+
+
+def build_evidence_header(
+    index: int,
+    evidence: dict,
 ) -> str:
     """
-    给检索到的证据添加编号。
+    生成证据标题，让 [1] 能对应到 PMID / URL。
+    """
+
+    metadata = get_metadata(evidence)
+    source_type = metadata.get(
+        "source_type",
+        evidence.get("source_type", "unknown"),
+    )
+
+    if source_type == "pubmed":
+        pmid = metadata.get(
+            "pmid",
+            evidence.get("pmid", ""),
+        )
+
+        return f"[{index}] PubMed PMID: {pmid}"
+
+    if source_type == "clinical_trial":
+        nct_id = metadata.get(
+            "nct_id",
+            evidence.get("nct_id", ""),
+        )
+
+        return f"[{index}] ClinicalTrials.gov NCT ID: {nct_id}"
+
+    if source_type == "guideline":
+        guideline_id = metadata.get(
+            "guideline_id",
+            evidence.get("guideline_id", ""),
+        )
+
+        return f"[{index}] Guideline ID: {guideline_id}"
+
+    return f"[{index}] Source: {source_type}"
+
+
+def build_evidence_metadata_lines(
+    evidence: dict,
+) -> list[str]:
+    """
+    将可追溯字段写入 prompt。
+    """
+
+    metadata = get_metadata(evidence)
+
+    field_map = [
+        ("title", "Title"),
+        ("journal", "Journal"),
+        ("year", "Year"),
+        ("doi", "DOI"),
+        ("nct_id", "NCT ID"),
+        ("guideline_id", "Guideline ID"),
+        ("organization", "Organization"),
+        ("topic", "Topic"),
+        ("status", "Status"),
+        ("study_type", "Study type"),
+        ("phase", "Phase"),
+        ("conditions", "Conditions"),
+        ("interventions", "Interventions"),
+        ("enrollment", "Enrollment"),
+        ("start_date", "Start date"),
+        ("completion_date", "Completion date"),
+        ("sponsor", "Sponsor"),
+        ("location", "Location"),
+        ("url", "URL"),
+        ("publication_types", "Publication types"),
+    ]
+
+    lines: list[str] = []
+
+    for field_name, label in field_map:
+        value = metadata.get(
+            field_name,
+            evidence.get(field_name, ""),
+        )
+
+        if value:
+            lines.append(f"{label}: {value}")
+
+    return lines
+
+
+def build_evidence_context(
+    evidence_list: list[dict],
+) -> str:
+    """
+    给检索到的证据添加编号和可追溯 metadata。
 
     例如：
 
-    [1]
+    [1] PubMed PMID: 12345678
     第一条证据……
 
-    [2]
+    [2] PubMed PMID: 23456789
     第二条证据……
     """
 
@@ -89,15 +204,121 @@ def build_evidence_context(
         evidence_list,
         start=1,
     ):
-        cleaned_evidence = " ".join(
-            evidence.split()
+        document = evidence.get(
+            "document",
+            "",
         )
 
+        cleaned_evidence = " ".join(
+            str(document).split()
+        )
+
+        lines = [
+            build_evidence_header(
+                index=index,
+                evidence=evidence,
+            ),
+            *build_evidence_metadata_lines(evidence),
+            "Evidence text:",
+            cleaned_evidence,
+        ]
+
         numbered_evidence.append(
-            f"[{index}]\n{cleaned_evidence}"
+            "\n".join(lines)
         )
 
     return "\n\n".join(numbered_evidence)
+
+
+def build_reference_summary(
+    evidence_list: list[dict],
+) -> str:
+    """
+    生成固定参考证据列表，避免最终答案只有 [1] 但没有 PMID。
+    """
+
+    references: list[str] = []
+
+    for index, evidence in enumerate(
+        evidence_list,
+        start=1,
+    ):
+        metadata = get_metadata(evidence)
+        source_type = metadata.get(
+            "source_type",
+            evidence.get("source_type", "unknown"),
+        )
+
+        if source_type == "pubmed":
+            pmid = metadata.get("pmid", "")
+            title = metadata.get("title", "")
+            journal = metadata.get("journal", "")
+            year = metadata.get("year", "")
+            url = metadata.get("url", "")
+
+            references.append(
+                " | ".join(
+                    part
+                    for part in [
+                        f"[{index}] PMID: {pmid}",
+                        title,
+                        journal,
+                        year,
+                        url,
+                    ]
+                    if part
+                )
+            )
+        elif source_type == "clinical_trial":
+            nct_id = metadata.get("nct_id", "")
+            title = metadata.get("title", "")
+            status = metadata.get("status", "")
+            conditions = metadata.get("conditions", "")
+            interventions = metadata.get("interventions", "")
+            url = metadata.get("url", "")
+
+            references.append(
+                " | ".join(
+                    part
+                    for part in [
+                        f"[{index}] NCT ID: {nct_id}",
+                        title,
+                        status,
+                        conditions,
+                        interventions,
+                        url,
+                    ]
+                    if part
+                )
+            )
+        elif source_type == "guideline":
+            guideline_id = metadata.get("guideline_id", "")
+            title = metadata.get("title", "")
+            organization = metadata.get("organization", "")
+            year = metadata.get("year", "")
+            topic = metadata.get("topic", "")
+            url = metadata.get("url", "")
+
+            references.append(
+                " | ".join(
+                    part
+                    for part in [
+                        f"[{index}] Guideline ID: {guideline_id}",
+                        title,
+                        organization,
+                        year,
+                        topic,
+                        url,
+                    ]
+                    if part
+                )
+            )
+        else:
+            references.append(
+                f"[{index}] Source: {source_type}"
+            )
+
+    return "\n".join(references)
 
 
 # ============================================================
@@ -106,13 +327,17 @@ def build_evidence_context(
 
 def build_prompt(
     question: str,
-    evidence_list: list[str],
+    evidence_list: list[dict],
 ) -> str:
     """
     构造发送给大模型的完整提示词。
     """
 
     context = build_evidence_context(
+        evidence_list
+    )
+
+    reference_summary = build_reference_summary(
         evidence_list
     )
 
@@ -129,16 +354,25 @@ def build_prompt(
 
 {context}
 
+证据编号与来源：
+
+{reference_summary}
+
 必须遵守以下要求：
 
 1. 只能使用上面提供的证据，不允许编造医学事实。
-2. 不允许编造作者、论文、期刊、指南、PMID 或统计数字。
+2. 不允许编造作者、论文、期刊、指南、PMID、NCT ID、指南 ID、统计数字或治疗阈值。
 3. 每个关键结论都必须标注对应证据编号，例如 [1]、[2]。
-4. 如果证据不足、证据与问题不完全相关，必须明确说明。
-5. 区分“生活方式干预”和“药物治疗”。
-6. 不提供针对个人的诊断、处方或停药建议。
-7. 使用中文回答。
-8. 提醒用户，实际治疗需要由医生结合具体情况判断。
+4. 必须区分证据类型：PubMed 文献、ClinicalTrials.gov 临床试验登记、指南/共识。
+5. 指南/共识可以说明推荐方向，但不得把它当作针对个人的诊断或处方。
+6. 如果证据不足、证据与问题不完全相关，必须明确说明，不要强行得出结论。
+7. 区分“生活方式干预”和“药物治疗”。
+8. 不提供针对个人的诊断、处方剂量、用药选择、停药建议或复诊间隔。
+9. 使用中文回答。
+10. 提醒用户，实际治疗需要由医生结合具体情况判断。
+11. 如果引用 PubMed 证据，“参考证据”部分必须列出 PMID、标题、期刊、年份和 URL。
+12. 如果引用 ClinicalTrials.gov 证据，“参考证据”部分必须列出 NCT ID、标题、状态和 URL。
+13. 如果引用指南/共识证据，“参考证据”部分必须列出指南 ID、标题、机构、年份和 URL。
 
 请严格按照下面的格式输出：
 
@@ -154,6 +388,14 @@ def build_prompt(
 
 根据证据说明药物治疗及其适用条件。
 
+## 临床试验证据
+
+根据 ClinicalTrials.gov 证据说明相关临床试验的状态、研究对象、干预措施和局限；如果没有相关临床试验证据，明确说明。
+
+## 指南/共识证据
+
+根据指南/共识证据说明推荐方向、适用范围和注意事项；如果没有相关指南/共识证据，明确说明。
+
 ## 证据局限
 
 说明当前证据有哪些不足。
@@ -164,7 +406,7 @@ def build_prompt(
 
 ## 参考证据
 
-列出本回答实际引用的证据编号。
+列出本回答实际引用的证据编号。PubMed 证据列出 PMID、标题、期刊、年份和 URL；ClinicalTrials.gov 证据列出 NCT ID、标题、状态和 URL；指南/共识证据列出指南 ID、标题、机构、年份和 URL。
 """.strip()
 
     return prompt
@@ -176,7 +418,7 @@ def build_prompt(
 
 def build_fallback_answer(
     question: str,
-    evidence_list: list[str],
+    evidence_list: list[dict],
     reason: str,
 ) -> str:
     """
@@ -216,8 +458,13 @@ def build_fallback_answer(
         evidence_list,
         start=1,
     ):
+        document = evidence.get(
+            "document",
+            "",
+        )
+
         cleaned_evidence = " ".join(
-            evidence.split()
+            str(document).split()
         )
 
         # 避免一条 PubMed XML 文本过长，
@@ -232,7 +479,9 @@ def build_fallback_answer(
 
         output.extend(
             [
-                f"### [{index}] 证据摘录",
+                f"### {build_evidence_header(index, evidence)}",
+                "",
+                *build_evidence_metadata_lines(evidence),
                 "",
                 cleaned_evidence,
                 "",
@@ -262,7 +511,11 @@ def call_openai(
     prompt: str,
 ) -> str:
     """
-    调用 OpenAI Responses API。
+    调用大模型 API。
+
+    如果配置了 OPENAI_BASE_URL，则按 OpenAI-compatible
+    Chat Completions 接口调用，适配学校或第三方大模型平台。
+    否则使用 OpenAI 官方 Responses API。
     """
 
     if not OPENAI_API_KEY:
@@ -270,20 +523,59 @@ def call_openai(
             ".env 中没有读取到 OPENAI_API_KEY。"
         )
 
-    client = OpenAI(
-        api_key=OPENAI_API_KEY,
-    )
+    client_kwargs = {
+        "api_key": OPENAI_API_KEY,
+    }
+
+    if OPENAI_BASE_URL:
+        client_kwargs["base_url"] = OPENAI_BASE_URL
+
+    client = OpenAI(**client_kwargs)
 
     print(
-        f"正在调用 OpenAI 模型：{OPENAI_MODEL}"
+        f"正在调用大模型：{OPENAI_MODEL}"
     )
 
-    response = client.responses.create(
-        model=OPENAI_MODEL,
-        input=prompt,
-    )
+    if OPENAI_BASE_URL:
+        print(
+            f"正在使用 OpenAI-compatible 接口：{OPENAI_BASE_URL}"
+        )
 
-    answer = response.output_text
+        response = client.chat.completions.create(
+            **{
+                "model": OPENAI_MODEL,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    }
+                ],
+                **(
+                    {
+                        "extra_body": {
+                            "thinking": {
+                                "type": LLM_THINKING,
+                            }
+                        }
+                    }
+                    if LLM_THINKING
+                    in {
+                        "enabled",
+                        "disabled",
+                    }
+                    else {}
+                ),
+            }
+        )
+
+        answer = response.choices[0].message.content
+    else:
+        response = client.responses.create(
+            model=OPENAI_MODEL,
+            input=prompt,
+        )
+
+        answer = response.output_text
 
     if not answer:
         raise RuntimeError(
@@ -322,7 +614,7 @@ def answer_question(
 
     print("正在从向量数据库检索证据...")
 
-    evidence_list = search(
+    evidence_list = search_with_details(
         query=question,
         topk=topk,
     )

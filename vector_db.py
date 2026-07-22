@@ -1,28 +1,41 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+BASE_DIR = Path(__file__).resolve().parent
+ENV_PATH = BASE_DIR / ".env"
+
+if ENV_PATH.exists():
+    load_dotenv(
+        dotenv_path=ENV_PATH,
+        override=True,
+    )
 
 # ============================================================
 # 必须在导入 torch、transformers、sentence_transformers 之前设置
-# 隐藏 NVIDIA 显卡，强制使用 CPU
+# 隐藏 NVIDIA 显卡，避免在没有 NVIDIA 显卡的机器上误选 CUDA
 # ============================================================
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import html
 import re
-from pathlib import Path
 
 import chromadb
+import torch
 from sentence_transformers import SentenceTransformer
+
+
+MetadataValue = str | int | float | bool
+Metadata = dict[str, MetadataValue]
 
 
 # ============================================================
 # 基础配置
 # ============================================================
-
-# vector_db.py 所在目录
-BASE_DIR = Path(__file__).resolve().parent
 
 # Chroma 数据库保存位置：
 # E:\OpenEvidence\chroma_db
@@ -37,6 +50,46 @@ MODEL_NAME = os.getenv(
     "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
 )
 
+EMBEDDING_DEVICE = os.getenv(
+    "EMBEDDING_DEVICE",
+    "cpu",
+).strip().lower()
+
+
+def resolve_embedding_device(device_name: str) -> str:
+    """
+    解析本地向量模型使用的设备。
+
+    可选值：
+    - cpu：最稳，默认值
+    - mps：Apple Silicon GPU
+    - auto：Mac 上优先使用 mps，否则退回 cpu
+    """
+
+    if device_name == "auto":
+        if torch.backends.mps.is_available():
+            return "mps"
+
+        return "cpu"
+
+    if device_name == "mps":
+        if torch.backends.mps.is_available():
+            return "mps"
+
+        print(
+            "提示：当前 PyTorch 不支持 mps，"
+            "已自动退回 CPU。"
+        )
+
+        return "cpu"
+
+    return "cpu"
+
+
+DEVICE = resolve_embedding_device(
+    EMBEDDING_DEVICE
+)
+
 
 # ============================================================
 # 加载向量模型
@@ -46,7 +99,7 @@ print(f"正在加载向量模型：{MODEL_NAME}")
 
 model = SentenceTransformer(
     MODEL_NAME,
-    device="cpu",
+    device=DEVICE,
 )
 
 print(f"向量模型设备：{model.device}")
@@ -214,6 +267,34 @@ def delete_existing_document(doc_id: str) -> None:
         )
 
 
+def normalize_metadata(
+    metadata: dict | None,
+) -> Metadata:
+    """
+    Chroma metadata 只支持简单标量；这里统一清洗。
+    """
+
+    if not metadata:
+        return {}
+
+    normalized: Metadata = {}
+
+    for key, value in metadata.items():
+        if value is None:
+            continue
+
+        if isinstance(value, bool):
+            normalized[key] = value
+        elif isinstance(value, int | float):
+            normalized[key] = value
+        elif isinstance(value, str):
+            normalized[key] = value
+        else:
+            normalized[key] = str(value)
+
+    return normalized
+
+
 # ============================================================
 # 文档入库
 # ============================================================
@@ -221,6 +302,7 @@ def delete_existing_document(doc_id: str) -> None:
 def add_document(
     text: str,
     doc_id: str,
+    metadata: dict | None = None,
 ) -> int:
     """
     将一篇文档切分、向量化并写入 Chroma。
@@ -249,10 +331,9 @@ def add_document(
     # 删除这个来源以前写入的旧文本块
     delete_existing_document(doc_id)
 
-    # 强制在 CPU 上计算向量
     embeddings = model.encode(
         chunks,
-        device="cpu",
+        device=DEVICE,
         convert_to_numpy=True,
         normalize_embeddings=True,
         show_progress_bar=False,
@@ -263,8 +344,11 @@ def add_document(
         for index in range(len(chunks))
     ]
 
-    metadata_list = [
+    base_metadata = normalize_metadata(metadata)
+
+    metadata_list: list[Metadata] = [
         {
+            **base_metadata,
             "source_id": doc_id,
             "chunk_index": index,
             "total_chunks": len(chunks),
@@ -327,7 +411,7 @@ def search(
 
     query_embedding = model.encode(
         cleaned_query,
-        device="cpu",
+        device=DEVICE,
         convert_to_numpy=True,
         normalize_embeddings=True,
         show_progress_bar=False,
@@ -395,7 +479,7 @@ def search_with_details(
 
     query_embedding = model.encode(
         cleaned_query,
-        device="cpu",
+        device=DEVICE,
         convert_to_numpy=True,
         normalize_embeddings=True,
         show_progress_bar=False,
@@ -446,14 +530,22 @@ def search_with_details(
         detailed_results.append(
             {
                 "document": document,
-                "source_id": metadata.get(
-                    "source_id",
-                    "unknown",
-                ),
-                "chunk_index": metadata.get(
-                    "chunk_index",
-                    -1,
-                ),
+                "metadata": metadata,
+                "source_id": metadata.get("source_id", "unknown"),
+                "source_type": metadata.get("source_type", "unknown"),
+                "pmid": metadata.get("pmid", ""),
+                "nct_id": metadata.get("nct_id", ""),
+                "guideline_id": metadata.get("guideline_id", ""),
+                "title": metadata.get("title", ""),
+                "organization": metadata.get("organization", ""),
+                "journal": metadata.get("journal", ""),
+                "year": metadata.get("year", ""),
+                "topic": metadata.get("topic", ""),
+                "status": metadata.get("status", ""),
+                "conditions": metadata.get("conditions", ""),
+                "interventions": metadata.get("interventions", ""),
+                "url": metadata.get("url", ""),
+                "chunk_index": metadata.get("chunk_index", -1),
                 "distance": distance,
             }
         )

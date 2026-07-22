@@ -3,6 +3,10 @@ chromadb
 sentence-transformers
 requests
 beautifulsoup4
-pymupdf
 tiktoken
 python-dotenv
+streamlit
+nicegui
+
+# Optional: only needed if the project later parses PDF files.
+# pymupdf
